@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Физио Журнал</title>
+  <meta name="description" content="Календарь, карты клиентов и каталог упражнений для физиотерапевта">
+  <meta name="theme-color" content="#f2f2f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Физио">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <link rel="icon" href="icon-192.png">
+  <link rel="manifest" href="manifest.json">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="bar">
+    <button id="back" class="link" hidden>‹ Назад</button>
+    <h1 id="title">Календарь</h1>
+    <button id="action" class="add" hidden></button>
+  </header>
+
+  <main id="view"></main>
+
+  <nav class="tabs">
+    <button class="tab" data-tab="calendar"><span>📅</span>Календарь</button>
+    <button class="tab" data-tab="clients"><span>👥</span>Клиенты</button>
+    <button class="tab" data-tab="catalog"><span>📚</span>Каталог</button>
+    <button class="tab" data-tab="more"><span>⚙️</span>Ещё</button>
+  </nav>
+
+  <div id="sheet" class="sheet" hidden><div id="sheetBody" class="sheet-body"></div></div>
+  <div id="toast" class="toast" role="status"></div>
+
+  <script src="catalog.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
