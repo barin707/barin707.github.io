@@ -1,6 +1,6 @@
 // Офлайн-кэш. При изменении файлов увеличь номер версии.
-const CACHE = 'physio-v1';
-const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'catalog.js', 'manifest.json', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
+const CACHE = 'physio-v2';
+const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'catalog.js', 'devices.js', 'gcal.js', 'manifest.json', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(FILES)).then(() => self.skipWaiting()));
@@ -10,7 +10,7 @@ self.addEventListener('activate', e => {
 });
 // Сначала сеть, при её отсутствии - кэш. Так обновления подтягиваются сами.
 self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
+  if (e.request.method !== 'GET' || new URL(e.request.url).origin !== location.origin) return;
   e.respondWith(
     fetch(e.request).then(r => {
       const copy = r.clone();

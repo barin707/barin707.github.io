@@ -3,10 +3,12 @@
 
   // ---------- Хранилище ----------
   const KEY = 'physio-app-v1';
-  const empty = () => ({ clients: [], appts: [], customEx: [] });
+  const ALL_DEVICES = ['hilt', 'uvt', 'magnet', 'us1', 'us3'];
+  const empty = () => ({ clients: [], appts: [], customEx: [], settings: { devices: [...ALL_DEVICES] } });
   let db;
   try { db = Object.assign(empty(), JSON.parse(localStorage.getItem(KEY) || '{}')); }
   catch (e) { db = empty(); }
+  if (!db.settings) db.settings = { devices: [...ALL_DEVICES] };
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { toast('Не удалось сохранить данные'); } };
 
   const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -40,6 +42,39 @@
   };
   const exById = id => allExercises().find(e => e.id === id);
   const zoneExercises = zid => allExercises().filter(e => e.zone === zid);
+
+  const devices = () => window.DEVICES;
+  const devById = id => devices().find(d => d.id === id);
+  const available = () => db.settings.devices || ALL_DEVICES;
+  const PROCS = [...window.DEVICES.map(d => ({ id: d.id, name: d.short })), { id: 'lfk', name: 'ЛФК' }, { id: 'massage', name: 'Массаж' }, { id: 'manual', name: 'Мануальная' }, { id: 'taping', name: 'Тейпирование' }];
+  const procName = id => (PROCS.find(p => p.id === id) || {}).name || id;
+  const hasKey = (text, k) => new RegExp('(^|[^а-яёa-z])' + k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(text);
+
+  const findWord = (text, k) => { const m = text.match(new RegExp('(?:^|[^а-яёa-z])(' + k + '[а-яёa-z]*)', 'i')); return m ? m[1] : ''; };
+
+  // Подбор аппаратного лечения по зонам, жалобам и противопоказаниям клиента
+  function recommend(c) {
+    const text = [c.complaints, c.diagnosis].join(' ').toLowerCase();
+    const risk = [c.contra, c.anamnesis, c.diagnosis, c.notes].join(' ').toLowerCase();
+    const zs = new Set(c.zones || []);
+    const guessed = [];
+    if (!zs.size) Object.entries(window.ZONE_KEYS).forEach(([z, keys]) => { if (keys.some(k => hasKey(text, k))) { zs.add(z); guessed.push(z); } });
+    const out = {};
+    zs.forEach(zid => (window.HARDWARE[zid] || []).forEach(h => {
+      if (!available().includes(h.d)) return;
+      const o = out[h.d] = out[h.d] || { dev: devById(h.d), items: [], score: 0, hits: new Set(), warn: [] };
+      o.items.push({ zone: zid, ...h });
+      o.score = Math.max(o.score, h.main ? 2 : 1);
+    }));
+    Object.values(out).forEach(o => {
+      (window.DEVICE_KEYS[o.dev.id] || []).forEach(k => { const w = findWord(text, k); if (w) o.hits.add(w); });
+      o.score += o.hits.size * 2;
+      window.DEVICE_CONTRA.forEach(r => { if (r.dev.includes(o.dev.id) && r.keys.some(k => hasKey(risk, k))) o.warn.push(r.text); });
+      if (o.dev.id === 'uvt' && ['остр', 'отёк', 'отек'].some(k => hasKey(text, k))) o.warn.push('В жалобах есть признаки острого процесса - УВТ обычно откладывают');
+      if (o.warn.length) o.score -= 3;
+    });
+    return { list: Object.values(out).sort((a, b) => b.score - a.score), guessed };
+  }
 
   const STATUS = { planned: 'Запланирован', done: 'Проведён', cancelled: 'Отменён', noshow: 'Не пришёл' };
   const clientById = id => db.clients.find(c => c.id === id);
@@ -107,15 +142,22 @@
     const daysIn = new Date(m.getFullYear(), m.getMonth() + 1, 0).getDate();
     const counts = {};
     db.appts.forEach(a => { if (a.status !== 'cancelled') counts[a.date] = (counts[a.date] || 0) + 1; });
+    const gcounts = {};
+    (db.gEvents || []).forEach(g => { gcounts[g.date] = (gcounts[g.date] || 0) + 1; });
     let cells = '';
     for (let i = 0; i < shift; i++) cells += '<div></div>';
     for (let d = 1; d <= daysIn; d++) {
       const s = ymd(new Date(m.getFullYear(), m.getMonth(), d));
       const cls = ['day', s === today() ? 'today' : '', s === ui.day ? 'sel' : ''].join(' ');
       const n = counts[s] || 0;
-      cells += `<button class="${cls}" data-act="pickDay" data-d="${s}"><span>${d}</span>${n ? `<i>${n > 3 ? '•••' : '•'.repeat(n)}</i>` : '<i></i>'}</button>`;
+      const g = gcounts[s] || 0;
+      cells += `<button class="${cls}" data-act="pickDay" data-d="${s}"><span>${d}</span><i>${n ? (n > 3 ? '•••' : '•'.repeat(n)) : ''}${g ? '<em>•</em>' : ''}</i></button>`;
     }
-    const list = db.appts.filter(a => a.date === ui.day).sort((a, b) => a.time.localeCompare(b.time));
+    const list = [
+      ...db.appts.filter(a => a.date === ui.day),
+      ...(db.gEvents || []).filter(g => g.date === ui.day).map(g => ({ ...g, google: true }))
+    ].sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+    const gc = db.gcal || {};
     const dd = parse(ui.day);
     return {
       title: 'Календарь',
@@ -131,11 +173,29 @@
           <div class="grid">${cells}</div>
           <button class="link small" data-act="goToday">Сегодня</button>
         </div>
+        ${gc.connected ? `<button class="gsync ${gc.dirty ? 'dirty' : ''}" data-act="gsync">
+          <span class="${gcal.isBusy() ? 'spin' : ''}">↻</span>
+          ${gcal.isBusy() ? 'Синхронизация…' : gc.dirty ? 'Google Календарь: есть несохранённые изменения - нажми, чтобы отправить'
+            : gc.lastSync ? `Google Календарь: синхронизировано ${syncAgo(gc.lastSync)}` : 'Google Календарь: синхронизировать'}
+        </button>` : ''}
         <h3 class="sec">${dd.getDate()} ${MONTHS_GEN[dd.getMonth()]}, ${WD_FULL[dd.getDay()]}</h3>
-        ${list.length ? `<div class="list">${list.map(apptRow).join('')}</div>`
+        ${list.length ? `<div class="list">${list.map(x => x.google ? gRow(x) : apptRow(x)).join('')}</div>`
           : `<div class="empty">На этот день записей нет.<br><button class="btn" data-act="newAppt">Записать клиента</button></div>`}
       `
     };
+  }
+
+  function gRow(g) {
+    return `<div class="row appt google">
+      <div class="time"><b>${g.allDay ? 'весь' : esc(g.time)}</b><small>${g.allDay ? 'день' : esc(g.end)}</small></div>
+      <div class="grow"><div class="name">${esc(g.title)}</div><small>Google Календарь</small></div></div>`;
+  }
+  function syncAgo(t) {
+    const m = Math.round((Date.now() - t) / 60000);
+    if (m < 1) return 'только что';
+    if (m < 60) return `${m} мин назад`;
+    const d = new Date(t);
+    return `${d.getDate()} ${MONTHS_GEN[d.getMonth()]} в ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
 
   function apptRow(a, withDate) {
@@ -222,10 +282,13 @@
         <h3 class="sec">Записи</h3>
         ${upcoming.length || past.length ? `<div class="list">${upcoming.map(x => apptRow(x, true)).join('')}${past.map(x => apptRow(x, true)).join('')}</div>` : '<div class="empty small">Записей нет.</div>'}
 
+        ${treatmentHtml(c, visits)}
+
         <h3 class="sec">Журнал визитов</h3>
         ${visits.length ? `<div class="list">${visits.map(v => `
           <button class="row visit" data-act="editVisit" data-cid="${c.id}" data-id="${v.id}">
             <div class="grow"><div class="name">${human(v.date)}${v.pain !== '' && v.pain != null ? ` <span class="pain p${painLevel(v.pain)}">боль ${esc(v.pain)}/10</span>` : ''}</div>
+            ${(v.procs || []).length ? `<div class="chips mini">${v.procs.map(x => `<span class="chip">${esc(procName(x))}</span>`).join('')}</div>` : ''}
             <div class="txt">${nl(v.text) || '<span class="muted">Без описания</span>'}</div></div></button>`).join('')}</div>`
           : '<div class="empty small">Визитов пока нет.</div>'}
 
@@ -244,6 +307,42 @@
       `
     };
   }
+  function treatmentHtml(c, visits) {
+    const plan = c.treatment || [];
+    const rec = recommend(c);
+    const done = id => visits.filter(v => (v.procs || []).includes(id)).length;
+    const planHtml = plan.length ? `<div class="list">${plan.map(t => {
+      const d = devById(t.device), n = done(t.device), total = Number(t.sessions) || 0;
+      return `<button class="row" data-act="editTreat" data-cid="${c.id}" data-id="${t.id}">
+        <span class="dev-ic">${d ? d.icon : '•'}</span>
+        <div class="grow"><div class="name">${esc(d ? d.name : t.device)}${t.zone && zoneById(t.zone) ? ` · ${zoneById(t.zone).name.toLowerCase()}` : ''}</div>
+        <small>${t.params ? esc(t.params) : 'Параметры не указаны'}</small>
+        ${total ? `<div class="bar-p"><i style="width:${Math.min(100, n / total * 100)}%"></i></div><small>${n} из ${total} процедур</small>` : `<small>Проведено: ${n}</small>`}</div>
+        <span class="chev">›</span></button>`;
+    }).join('')}</div>` : '<div class="empty small">План аппаратного лечения не составлен.</div>';
+
+    const recHtml = rec.list.length ? rec.list.map(o => {
+      const inPlan = plan.some(t => t.device === o.dev.id);
+      return `<div class="card rec ${o.warn.length ? 'has-warn' : ''}">
+        <div class="rec-head"><span class="dev-ic">${o.dev.icon}</span><b>${esc(o.dev.name)}</b>
+          ${o.items.some(i => i.main) && !o.warn.length ? '<span class="tag">метод выбора</span>' : ''}</div>
+        ${o.hits.size ? `<small class="muted">По жалобам: ${[...o.hits].map(esc).join(', ')}</small>` : ''}
+        ${o.items.map(i => `<div class="rec-item"><b>${zoneById(i.zone).icon} ${zoneById(i.zone).name}.</b> ${esc(i.when)} <span class="muted">${esc(i.how)}</span></div>`).join('')}
+        ${o.warn.length ? `<div class="rec-warn">⚠️ Проверь противопоказания: ${o.warn.map(esc).join('; ')}</div>` : ''}
+        <button class="btn wide" data-act="addTreat" data-cid="${c.id}" data-dev="${o.dev.id}" data-zone="${o.items[0].zone}">${inPlan ? '✓ Уже в плане - добавить ещё' : '+ Добавить в план'}</button>
+      </div>`;
+    }).join('') : `<div class="empty small">${(c.zones || []).length || c.complaints ? 'Нет подходящих аппаратов. Проверь список аппаратов в разделе «Ещё».' : 'Отметь проблемные зоны или опиши жалобы - и здесь появятся рекомендации.'}</div>`;
+
+    return `
+      <h3 class="sec">План аппаратного лечения</h3>
+      ${planHtml}
+      <button class="btn wide" data-act="addTreat" data-cid="${c.id}">+ Добавить процедуру</button>
+      <h3 class="sec">Рекомендуемое аппаратное лечение</h3>
+      ${rec.guessed.length ? `<p class="lead small">Зоны определены по жалобам: ${rec.guessed.map(z => zoneById(z).name.toLowerCase()).join(', ')}. Отметь их в карте для точности.</p>` : ''}
+      ${recHtml}
+      <p class="lead small">Подбор учитывает зоны, жалобы, диагноз и противопоказания из карты. Окончательное решение - за специалистом.</p>`;
+  }
+
   const painLevel = p => (p >= 7 ? 3 : p >= 4 ? 2 : 1);
 
   function painSvg(list) {
@@ -271,7 +370,12 @@
           <button class="zone" data-go="zone:${z.id}">
             <span class="zi">${z.icon}</span><b>${z.name}</b>
             <small>${zoneExercises(z.id).length} упр.</small></button>`).join('')}
-        </div>`
+        </div>
+        <h3 class="sec">Аппаратное лечение</h3>
+        <div class="list">${devices().map(d => `
+          <button class="row" data-go="device:${d.id}"><span class="dev-ic">${d.icon}</span>
+            <div class="grow"><div class="name">${esc(d.name)}</div><small>${available().includes(d.id) ? 'Есть в кабинете' : 'Нет в кабинете'}</small></div>
+            <span class="chev">›</span></button>`).join('')}</div>`
     };
   }
 
@@ -287,12 +391,43 @@
         <h3 class="sec">Рекомендации</h3>
         <div class="card"><ul class="tips">${z.tips.map(t => `<li>${esc(t)}</li>`).join('')}</ul></div>
         <div class="card warn"><b>⚠️ Красные флаги</b><p>${esc(z.redFlags)}</p></div>
+        ${hwForZone(z.id)}
         <h3 class="sec">Упражнения</h3>
         <div class="list">${ex.map(e => `
           <button class="row" data-act="showEx" data-id="${e.id}">
             <div class="grow"><div class="name">${esc(e.name)}${e.custom ? ' <span class="tag">своё</span>' : ''}</div>
             <small>${esc(e.level || '')}${e.level && e.dose ? ' · ' : ''}${esc(e.dose || '')}</small></div>
             <span class="chev">›</span></button>`).join('')}</div>`
+    };
+  }
+
+  function hwForZone(zid) {
+    const items = (window.HARDWARE[zid] || []).filter(h => available().includes(h.d));
+    if (!items.length) return '';
+    return `<h3 class="sec">Аппаратное лечение</h3><div class="list">${items.map(h => {
+      const d = devById(h.d);
+      return `<button class="row hw" data-go="device:${d.id}"><span class="dev-ic">${d.icon}</span>
+        <div class="grow"><div class="name">${esc(d.name)}${h.main ? ' <span class="tag">метод выбора</span>' : ''}</div>
+        <div class="txt">${esc(h.when)}</div><small>${esc(h.how)}</small></div></button>`;
+    }).join('')}</div>`;
+  }
+
+  function renderDevice(r) {
+    const d = devById(r.id);
+    if (!d) return null;
+    const zs = zones().filter(z => (window.HARDWARE[z.id] || []).some(h => h.d === d.id));
+    return {
+      title: d.short,
+      html: `
+        <div class="card"><h2>${d.icon} ${esc(d.name)}</h2><p>${esc(d.about)}</p></div>
+        <h3 class="sec">Ориентировочные параметры</h3>
+        <div class="card"><p>${esc(d.params)}</p><p class="muted small">Точные режимы - по протоколу производителя твоего аппарата.</p></div>
+        <div class="card warn"><b>⚠️ Противопоказания</b><ul class="tips">${d.contra.map(x => `<li>${esc(x)}</li>`).join('')}</ul></div>
+        <h3 class="sec">Показания по зонам</h3>
+        <div class="list">${zs.map(z => { const h = window.HARDWARE[z.id].find(x => x.d === d.id); return `
+          <button class="row hw" data-go="zone:${z.id}"><span class="dev-ic">${z.icon}</span>
+            <div class="grow"><div class="name">${z.name}${h.main ? ' <span class="tag">метод выбора</span>' : ''}</div>
+            <div class="txt">${esc(h.when)}</div><small>${esc(h.how)}</small></div></button>`; }).join('')}</div>`
     };
   }
 
@@ -306,6 +441,14 @@
           <div class="card"><b>${db.clients.length}</b><small>клиентов</small></div>
           <div class="card"><b>${db.appts.filter(a => a.date >= today() && a.status === 'planned').length}</b><small>предстоящих записей</small></div>
           <div class="card"><b>${visits}</b><small>визитов в журнале</small></div>
+        </div>
+        <h3 class="sec">Google Календарь</h3>
+        ${googleHtml()}
+        <h3 class="sec">Аппараты в кабинете</h3>
+        <div class="card">
+          <p class="muted">Рекомендации в картах клиентов учитывают только отмеченные аппараты.</p>
+          ${devices().map(d => `<label class="switch"><span>${d.icon} ${esc(d.name)}</span>
+            <input type="checkbox" data-dev="${d.id}" ${available().includes(d.id) ? 'checked' : ''}><i></i></label>`).join('')}
         </div>
         <h3 class="sec">Резервная копия</h3>
         <div class="card">
@@ -324,11 +467,67 @@
         <div class="card"><button class="btn wide danger-btn" data-act="wipe">Удалить все данные</button></div>
         <p class="foot">Каталог упражнений - справочный. Подбор и дозировка остаются на решении специалиста.</p>
       `,
-      after: () => { $('#importFile').onchange = e => importFile(e.target.files[0]); }
+      after: () => {
+        $('#importFile').onchange = e => importFile(e.target.files[0]);
+        view.querySelectorAll('input[data-dev]').forEach(i => i.onchange = () => {
+          const set = new Set(available());
+          i.checked ? set.add(i.dataset.dev) : set.delete(i.dataset.dev);
+          db.settings.devices = ALL_DEVICES.filter(x => set.has(x)); save();
+        });
+        const cid = $('#gClientId');
+        if (cid) $('#gSaveId').onclick = () => {
+          const v = cid.value.trim();
+          if (!/\.apps\.googleusercontent\.com$/.test(v)) return toast('Похоже, это не Client ID. Он заканчивается на .apps.googleusercontent.com');
+          gcal.cfg().clientId = v; save(); render(); toast('Client ID сохранён');
+        };
+        const sel = $('#gCal');
+        if (sel && gcal.hasToken()) gcal.calendars().then(list => {
+          sel.innerHTML = list.map(x => `<option value="${esc(x.id)}" ${x.id === gcal.cfg().calendarId ? 'selected' : ''}>${esc(x.name)}${x.primary ? ' (основной)' : ''}</option>`).join('');
+          sel.disabled = false;
+          sel.onchange = () => {
+            if (!confirm('Записи будут созданы в выбранном календаре заново. Старые события в прежнем календаре останутся. Продолжить?')) { sel.value = gcal.cfg().calendarId; return; }
+            gcal.setCalendar(sel.value, sel.options[sel.selectedIndex].text);
+          };
+        }).catch(() => {});
+      }
     };
   }
 
-  const PAGES = { client: renderClient, zone: renderZone };
+  function googleHtml() {
+    const c = db.gcal || {};
+    const ics = `<button class="btn wide" data-act="exportIcs">📆 Выгрузить все записи в файл .ics</button>
+      <p class="muted small">Файл .ics можно открыть на iPhone или импортировать в Google Календарь вручную. Работает без настройки.</p>`;
+    const guide = `<details class="guide"><summary>Как получить Client ID (один раз, ~10 минут)</summary><ol class="tips">
+      <li>Открой <a href="https://console.cloud.google.com/" target="_blank" rel="noopener">console.cloud.google.com</a> и войди своим Google-аккаунтом.</li>
+      <li>Создай проект, например «Физио Журнал».</li>
+      <li>В разделе «APIs & Services» → «Library» найди <b>Google Calendar API</b> и нажми «Enable».</li>
+      <li>«OAuth consent screen»: тип <b>External</b>, укажи название и свою почту. В «Test users» добавь свою почту.</li>
+      <li>«Credentials» → «Create credentials» → <b>OAuth client ID</b> → тип <b>Web application</b>.</li>
+      <li>В «Authorized JavaScript origins» добавь: <code>${esc(location.origin)}</code></li>
+      <li>В «Authorized redirect URIs» добавь: <code>${esc(gcal.redirectUri())}</code></li>
+      <li>Скопируй Client ID и вставь его выше.</li></ol></details>`;
+    if (!c.clientId) return `<div class="card">
+      <p>Записи из приложения будут сами появляться в твоём Google Календаре, а личные события из Google - в календаре приложения. Так видно все пересечения.</p>
+      <label class="lbl-in">Client ID<input id="gClientId" placeholder="….apps.googleusercontent.com" autocomplete="off" autocapitalize="off"></label>
+      <button class="btn wide primary" id="gSaveId">Сохранить</button>
+      ${guide}${ics}</div>`;
+    if (!c.connected) return `<div class="card">
+      <p>Client ID указан. Осталось войти в Google и разрешить доступ к календарю.</p>
+      <button class="btn wide primary" data-act="gconnect">Подключить Google Календарь</button>
+      <button class="btn wide" data-act="gresetId">Изменить Client ID</button>
+      ${ics}</div>`;
+    return `<div class="card">
+      <p>✅ Подключено${c.lastSync ? `. Последняя синхронизация ${syncAgo(c.lastSync)}` : ''}.</p>
+      ${c.error ? `<p class="err">Ошибка: ${esc(c.error)}</p>` : ''}
+      <label class="lbl-in">Календарь для записей<select id="gCal" ${gcal.hasToken() ? '' : 'disabled'}><option>${esc(c.calendarName || 'Основной')}</option></select></label>
+      ${gcal.hasToken() ? '' : '<p class="muted small">Сеанс Google истёк. При следующей синхронизации приложение попросит войти снова.</p>'}
+      <button class="btn wide primary" data-act="gsync">↻ Синхронизировать сейчас</button>
+      <button class="btn wide" data-act="gdisconnect">Отключить</button>
+      <p class="muted small">В Google уходят только имя клиента, телефон и комментарий к записи. Диагнозы и медицинская карта остаются на телефоне.</p>
+      ${ics}</div>`;
+  }
+
+  const PAGES = { client: renderClient, zone: renderZone, device: renderDevice };
 
   // ---------- Шторки (формы) ----------
   const sheet = $('#sheet'), sheetBody = $('#sheetBody');
@@ -379,7 +578,7 @@
           const nc = { id: uid(), createdAt: Date.now(), visits: [], plan: [], ...d };
           db.clients.push(nc); save(); closeSheet();
           ui.tab = 'clients'; ui.stacks.clients = [{ page: 'client', id: nc.id }]; render(true);
-        } else { Object.assign(c, d); save(); closeSheet(); render(); }
+        } else { Object.assign(c, d); save(); closeSheet(); render(); gcal.changed(); }
         toast('Сохранено');
       };
     });
@@ -408,6 +607,7 @@
         <label>Комментарий<textarea name="note" rows="2" placeholder="Например: массаж ШВЗ, ЛФК">${esc(a.note)}</textarea></label>
         ${!isNew ? `<button type="button" class="btn wide" id="toCard">Открыть карту клиента</button>
         <button type="button" class="btn wide" id="toVisit">📝 Записать визит в журнал</button>
+        ${!(db.gcal && db.gcal.connected) ? `<a class="btn wide" target="_blank" rel="noopener" href="${gcal.templateUrl(a)}">Добавить в Google Календарь</a>` : ''}
         <button type="button" class="btn wide danger-btn" id="del">Удалить запись</button>` : ''}
       </div></form>`, b => {
       $('#f', b).onsubmit = e => {
@@ -416,19 +616,21 @@
         if (!d.clientId) return toast('Выбери клиента');
         d.dur = Number(d.dur);
         const clash = db.appts.find(x => x.id !== a.id && x.date === d.date && x.status !== 'cancelled' &&
-          d.status !== 'cancelled' && overlap(x.time, x.dur, d.time, d.dur));
+          d.status !== 'cancelled' && overlap(x.time, x.dur, d.time, d.dur))
+          || (d.status !== 'cancelled' && (db.gEvents || []).find(g => !g.allDay && g.date === d.date && overlap(g.time, g.dur, d.time, d.dur)));
         if (isNew) db.appts.push({ id: uid(), ...d }); else Object.assign(db.appts.find(x => x.id === a.id), d);
         save(); closeSheet();
         ui.day = d.date; ui.month = new Date(parse(d.date).getFullYear(), parse(d.date).getMonth(), 1);
         render();
-        toast(clash ? `Сохранено. Пересекается с записью в ${clash.time}` : 'Сохранено');
+        gcal.changed();
+        toast(clash ? `Сохранено. Пересекается${clash.title ? ` с «${clash.title}»` : ''} в ${clash.time}` : 'Сохранено');
       };
       if (!isNew) {
-        $('#del', b).onclick = () => { if (confirm('Удалить запись?')) { db.appts = db.appts.filter(x => x.id !== a.id); save(); closeSheet(); render(); } };
+        $('#del', b).onclick = () => { if (confirm('Удалить запись?')) { gcal.removed(a); db.appts = db.appts.filter(x => x.id !== a.id); save(); closeSheet(); render(); } };
         $('#toCard', b).onclick = () => { closeSheet(); ui.tab = 'clients'; ui.stacks.clients = [{ page: 'client', id: a.clientId }]; render(true); };
         $('#toVisit', b).onclick = () => {
           const appt = db.appts.find(x => x.id === a.id);
-          if (appt.status === 'planned') { appt.status = 'done'; save(); }
+          if (appt.status === 'planned') { appt.status = 'done'; save(); gcal.changed(); }
           closeSheet(); setTimeout(() => visitSheet(a.clientId, null, { date: a.date, text: a.note || '' }), 260);
         };
       }
@@ -446,6 +648,8 @@
         <label>Дата<input type="date" name="date" required value="${esc(v.date)}"></label>
         <div class="lbl">Боль по шкале 0-10: <b id="pv">${v.pain === '' ? 'не указана' : esc(v.pain)}</b></div>
         <input type="range" min="0" max="10" step="1" name="pain" value="${v.pain === '' ? 0 : esc(v.pain)}" id="pain" class="${v.pain === '' ? 'unset' : ''}">
+        <div class="lbl">Проведённые процедуры</div>
+        <div class="chips pick">${PROCS.filter(x => !devById(x.id) || available().includes(x.id) || (v.procs || []).includes(x.id)).map(x => `<label class="chip"><input type="checkbox" name="proc" value="${x.id}" ${(v.procs || []).includes(x.id) ? 'checked' : ''}><span>${esc(x.name)}</span></label>`).join('')}</div>
         <label>Что сделано и результат<textarea name="text" rows="6" placeholder="Осмотр, тесты, процедуры, реакция клиента, рекомендации">${esc(v.text)}</textarea></label>
         ${vid ? '<button type="button" class="btn wide danger-btn" id="del">Удалить визит</button>' : ''}
       </div></form>`, b => {
@@ -456,6 +660,8 @@
         e.preventDefault();
         const d = formData(e.target);
         d.pain = painSet ? Number(d.pain) : '';
+        d.procs = [...e.target.querySelectorAll('input[name=proc]:checked')].map(i => i.value);
+        delete d.proc;
         if (vid) Object.assign(v, d); else (c.visits = c.visits || []).push({ id: uid(), ...d });
         save(); closeSheet();
         ui.tab = 'clients';
@@ -545,6 +751,53 @@
     });
   }
 
+  function treatSheet(cid, tid, preset) {
+    const c = clientById(cid);
+    const t = tid ? (c.treatment || []).find(x => x.id === tid) : { sessions: '', ...preset };
+    const devList = devices().filter(d => available().includes(d.id) || d.id === t.device);
+    const hint = (dev, zone) => {
+      const h = (window.HARDWARE[zone] || []).find(x => x.d === dev);
+      const d = devById(dev);
+      return [h ? h.how : '', d ? d.params : ''].filter(Boolean).join(' ');
+    };
+    if (!t.device) t.device = devList[0]?.id;
+    if (!t.zone) t.zone = (c.zones || [])[0] || zones()[0].id;
+    openSheet(`<form id="f">
+      ${formHead(tid ? 'Процедура' : 'Новая процедура')}
+      <div class="form">
+        <label>Аппарат<select name="device">${devList.map(d => `<option value="${d.id}" ${d.id === t.device ? 'selected' : ''}>${d.icon} ${esc(d.name)}</option>`).join('')}</select></label>
+        <label>Зона<select name="zone">${zones().map(z => `<option value="${z.id}" ${z.id === t.zone ? 'selected' : ''}>${z.icon} ${z.name}</option>`).join('')}</select></label>
+        <label>Параметры<textarea name="params" rows="3" placeholder="Режим, мощность, время, количество импульсов">${esc(t.params)}</textarea></label>
+        <div class="hint" id="hint"></div>
+        <div class="two">
+          <label>Курс, процедур<input type="number" inputmode="numeric" min="0" name="sessions" value="${esc(t.sessions)}"></label>
+          <label>Частота<input name="freq" value="${esc(t.freq)}" placeholder="2 р/нед"></label>
+        </div>
+        <label>Комментарий<textarea name="note" rows="2">${esc(t.note)}</textarea></label>
+        <div class="card warn" id="cw" hidden></div>
+        ${tid ? '<button type="button" class="btn wide danger-btn" id="del">Удалить из плана</button>' : ''}
+      </div></form>`, b => {
+      const f = $('#f', b);
+      const upd = () => {
+        $('#hint', b).innerHTML = `💡 ${esc(hint(f.device.value, f.zone.value))} <button type="button" class="link small-inline" id="useHint">Вставить</button>`;
+        $('#useHint', b).onclick = () => { f.params.value = hint(f.device.value, f.zone.value); };
+        const w = (recommend(c).list.find(o => o.dev.id === f.device.value) || { warn: [] }).warn;
+        const risk = [c.contra, c.anamnesis, c.diagnosis, c.notes].join(' ').toLowerCase();
+        const all = w.length ? w : window.DEVICE_CONTRA.filter(r => r.dev.includes(f.device.value) && r.keys.some(k => hasKey(risk, k))).map(r => r.text);
+        const cw = $('#cw', b); cw.hidden = !all.length; cw.innerHTML = `<b>⚠️ Проверь противопоказания</b><p>${all.map(esc).join('; ')}</p>`;
+      };
+      f.device.onchange = upd; f.zone.onchange = upd; upd();
+      f.onsubmit = e => {
+        e.preventDefault();
+        const d = formData(f);
+        c.treatment = c.treatment || [];
+        if (tid) Object.assign(t, d); else c.treatment.push({ id: uid(), ...d });
+        save(); closeSheet(); render(); toast('План обновлён');
+      };
+      if (tid) $('#del', b).onclick = () => { if (confirm('Удалить процедуру из плана?')) { c.treatment = c.treatment.filter(x => x.id !== tid); save(); closeSheet(); render(); } };
+    });
+  }
+
   function exerciseSheet(e) {
     const isNew = !e || !e.id;
     e = e || {};
@@ -592,15 +845,24 @@
       const c = clientById(d.id);
       if (!confirm(`Удалить клиента «${c.name}» вместе с записями и журналом?`)) return;
       db.clients = db.clients.filter(x => x.id !== d.id);
+      db.appts.filter(a => a.clientId === d.id).forEach(a => gcal.removed(a));
       db.appts = db.appts.filter(a => a.clientId !== d.id);
       save(); pop(); toast('Клиент удалён');
     },
     sharePlan: d => sharePlan(clientById(d.id)),
     export: exportData,
+    gsync: () => gcal.sync({ interactive: true }),
+    gconnect: () => gcal.login('sync'),
+    gdisconnect: () => { if (confirm('Отключить Google Календарь? События, уже созданные в Google, останутся.')) { gcal.disconnect(); render(); } },
+    gresetId: () => { gcal.cfg().clientId = ''; save(); render(); },
+    exportIcs: () => shareFile(gcal.ics(db.appts), `physio-${today()}.ics`, 'text/calendar'),
+    addTreat: d => treatSheet(d.cid, null, { device: d.dev, zone: d.zone }),
+    editTreat: d => treatSheet(d.cid, d.id),
     wipe: () => {
       if (!confirm('Удалить всех клиентов, записи и свои упражнения? Это нельзя отменить.')) return;
       if (!confirm('Точно? Лучше сначала сохрани копию.')) return;
-      db = empty(); save(); render(); toast('Данные удалены');
+      const gcfg = db.gcal, gone = db.appts.filter(a => a.gid).map(a => a.gid);
+      db = empty(); db.gcal = gcfg; db.gDeleted = gone; save(); render(); gcal.changed(); toast('Данные удалены');
     }
   };
 
@@ -620,9 +882,13 @@
   }
 
   async function exportData() {
-    const json = JSON.stringify({ app: 'physio', version: 1, exportedAt: new Date().toISOString(), ...db }, null, 2);
-    const name = `physio-backup-${today()}.json`;
-    const file = new File([json], name, { type: 'application/json' });
+    const { gEvents, gDeleted, ...data } = db;
+    const json = JSON.stringify({ app: 'physio', version: 2, exportedAt: new Date().toISOString(), ...data }, null, 2);
+    return shareFile(json, `physio-backup-${today()}.json`, 'application/json');
+  }
+
+  async function shareFile(content, name, type) {
+    const file = new File([content], name, { type });
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
       try { await navigator.share({ files: [file], title: name }); return; } catch (e) { if (e.name === 'AbortError') return; }
     }
@@ -639,7 +905,10 @@
         const d = JSON.parse(r.result);
         if (!Array.isArray(d.clients) || !Array.isArray(d.appts)) throw new Error();
         if (!confirm(`В файле ${d.clients.length} клиентов и ${d.appts.length} записей. Заменить текущие данные?`)) return;
-        db = { clients: d.clients, appts: d.appts, customEx: d.customEx || [] };
+        const gcfg = db.gcal;
+        db = { clients: d.clients, appts: d.appts, customEx: d.customEx || [], settings: d.settings || { devices: [...ALL_DEVICES] }, gcal: gcfg };
+        if (!gcfg || gcfg.calendarId !== (d.gcal || {}).calendarId) db.appts.forEach(a => { delete a.gid; delete a.gsig; });
+        gcal.changed();
         save(); render(); toast('Данные восстановлены');
       } catch (e) { toast('Файл не подходит'); }
     };
@@ -653,7 +922,16 @@
     clearTimeout(tt); tt = setTimeout(() => t.classList.remove('show'), 2200);
   }
 
+  const gcal = window.createGCal({
+    db: () => db, save, render: () => render(), toast, clientById,
+    onSyncState: () => { if (ui.tab === 'calendar' && !ui.stacks.calendar.length) render(); }
+  });
+  const afterLogin = gcal.handleRedirect();
   render(true);
+  if (afterLogin === 'sync' || (db.gcal && db.gcal.connected && gcal.hasToken())) gcal.sync({ interactive: afterLogin === 'sync' });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && db.gcal && db.gcal.connected && gcal.hasToken()) gcal.sync();
+  });
 
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
 })();
